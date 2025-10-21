@@ -3,6 +3,109 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def _attn_fwd_inner(
+    O_block,
+    l_i,
+    m_i,
+    Q_block,
+    K_block_ptr,
+    V_block_ptr,
+    block_index_q,
+    softmax_scale,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    STAGE: tl.constexpr,
+    offs_q: tl.constexpr,
+    offs_kv: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    ):
+    """
+    forward pass kernel 2 (inner loop, over K,V) # TODO: verify
+    """
+
+    # stage-wise handling
+    if STAGE == 1:
+        # causal attention (mask out)
+        low, high = 0, block_index_q * BLOCK_SIZE_Q
+    if STAGE == 2:
+        # for the block where there is transition between non-masked and masked keys
+        low, high = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        low - tl.multiple_of(low, BLOCK_SIZE_Q) # ???
+    else:
+        # non-causal attention (no masking out)
+        low, high = 0, SEQ_LEN
+
+    # point to relevant K and V blocks respectively
+    K_block_ptr = tl.advance(K_block_ptr, (0, low))
+    V_block_ptr = tl.advance(V_block_ptr, (low, 0))
+
+    # loop over K, V and update accumulator
+    for start_kv in range(low, high, BLOCK_SIZE_KV):
+        # letting the compiler know that start_n is a multiple of BLOCK_N, so that the compiler can do optimizations
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
+        # compute q @ k
+        K_block = tl.load(K_block_ptr)
+        QK_block = tl.dot(Q_block, K_block)
+
+        if STAGE == 2: # for diagonal elements in q @ k
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :]) # ???
+            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6) # ???
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            QK_block -= m_ij[:, None]
+        else:
+            # compute the maximum value of q @ k or keep the old max value
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_scale)
+            QK_block = QK_block * softmax_scale - m_ij[:, None]
+
+        # compute the exponential of each dot product, so now we are computing exp(qk_ij - m_ij)
+        P_block = tl.math.exp(QK_block)
+
+        # compute the sum by rows of the attention scores
+        l_ij = tl.sum(P_block, 1)
+
+        # this is the Correction Factor for the previous l_i
+        alpha = tl.math.exp(m_i - m_ij)
+
+        # apply the Correction Factor to the previous l_i and add the new l_ij
+        l_i = l_i * alpha + l_ij
+
+        # load the V_block to SRAM from HBM
+        V_block = tl.load(V_block_ptr)
+
+        P_block = P_block.to(tl.float16)
+
+        # this computes: O_new = P * V + O_old * alpha
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block)
+
+        # update the m_i
+        m_i = m_ij
+
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+
+    return O_block, l_i, m_i
+
+
+@triton.autotune(
+        [
+            triton.Config(
+                {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+            for BLOCK_SIZE_Q in [64, 128] # try, select best
+            for BLOCK_SIZE_KV in [32, 64] # try, select best
+            for num_stages in [[3, 4, 7]] # ???
+            for num_warps in [2, 4] # try, select best # TODO: verify
+        ],
+        key=["SEQ_LEN", "HEAD_DIM"], # run across each pair of SEQ_LEN, HEAD_DIM, select 'max-throughput-in-least-time' config
+        
+)
+
+
 @triton.jit 
 def _attn_fwd(
     Q, # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
@@ -35,6 +138,10 @@ def _attn_fwd(
     BLOCK_SIZE_KV: tl.constexpr,
     STAGE = tl.constexpr,
     ):
+    """
+    forward pass kernel 1
+    """
+
     tl.static_assert(BLOCK_SIZE_KV <= NUM_HEADS)
 
     # indicates which block in the sequence length to process
@@ -108,12 +215,46 @@ def _attn_fwd(
     # acc: the accumulator for the output block, which is a group of rows of the O block
     O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
 
-    # TODO: causal or non-causal attention O_block, l_i, m_i
+    if STAGE == 1 or STAGE == 3: # TODO: check again
+        # non-causal attention 
+        O_block, l_i, m_i = _attn_fwd_inner( # forward pass kernel 2 called here
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            4 - STAGE,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
+
+    if STAGE == 3: # TODO: check again
+        # causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            4 - STAGE,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
 
     # needed for computing logsumexp (for the backward pass)
-    m_i += tl.math.log(
-        l_i
-    )
+    m_i += tl.math.log(l_i)
 
     # normalize the block at the end, after computing all normalization factors for all rows for the current output block
     O_block = O_block / l_i[:, None]
