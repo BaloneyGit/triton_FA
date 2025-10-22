@@ -101,8 +101,7 @@ def _attn_fwd_inner(
             for num_stages in [[3, 4, 7]] # ???
             for num_warps in [2, 4] # try, select best # TODO: verify
         ],
-        key=["SEQ_LEN", "HEAD_DIM"], # run across each pair of SEQ_LEN, HEAD_DIM, select 'max-throughput-in-least-time' config
-        
+        key=["SEQ_LEN", "HEAD_DIM"], # run across each pair of SEQ_LEN, HEAD_DIM, select 'max-throughput-in-least-time' config       
 )
 
 
